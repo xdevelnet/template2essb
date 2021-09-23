@@ -43,7 +43,7 @@
 #define POSIX_FAIL -1
 #define STACK_REDUNDANCE 1024
 
-const char essb_signature[] = "SSBTEMPLATE01";
+const char essb_signature[] = "SSBTEMPLATE0";
 const char ssb_ext_w_dot[] = ".ssb";
 const char html_ext_w_dot[] = ".html";
 const char opening_scope_sigil[] = "{{";
@@ -53,6 +53,27 @@ const char error_occured_formatted[] = "An error occured during processing %s. E
 const char template_processing_done_formatted[] = "Template processing is done, result has been saved to %s%s\n";
 const char error_stack_reached[] = "Filepath is bigger then available stack! U MAD BRUH!";
 const uint32_t max_tag_length = 2147483646; // 2^32/2-2
+
+int32_t *ve;
+size_t v_max = 5;
+size_t v_amount;
+
+static void vec_reset() {
+	v_amount = 0;
+}
+
+static bool vec_add(int32_t val) {
+	ve[v_amount] = val;
+	v_amount++;
+	if (v_amount == v_max) {
+		v_max += 10;
+		int32_t *temp = realloc(ve, v_max * sizeof(int32_t));
+		if (temp == NULL) return false;
+		ve = temp;
+	}
+
+	return true;
+}
 
 static inline bool correct_html_ext(const char *p) {
 	// above
@@ -139,24 +160,20 @@ int getwfd(const char *rfname, const char *ext, size_t elen, char *wrfname_done)
 	return fd;
 }
 
-static inline uint32_t swap_uint32( uint32_t val ) {
-	val = ((val << 8) & 0xFF00FF00 ) | ((val >> 8) & 0xFF00FF );
-	return (val << 16) | (val >> 16);
-}
-
-static inline uint32_t *compaq32le(size_t val, uint32_t *temp) {
-	// above
-	// convert val to 32bit unsigned integer and save it to memory, referenced by temp pointer. Return temp pointer.
-
-	uint32_t v;
-	if (IS_BIG_ENDIAN) v = swap_uint32((uint32_t) val); else v = (uint32_t) val;
-	*temp = v;
-	return temp;
-}
-
 #define WFDRITE(b, c) if (write((wfd),(b),(c))<0)goto posix_error // return if write() fails
-#define DSLICE_ADD(b, c) {WFDRITE(compaq32le(c, &temp), sizeof(uint32_t));WFDRITE(b, c);}
-#define DSLICE_ADD_TAG(b, c) {compaq32le(c, &temp); temp++; WFDRITE(&temp, sizeof(uint32_t)); WFDRITE("\0", 1); WFDRITE(b, c);}
+#define ADDRITE(c) if (vec_add(c) == false)goto posix_error
+
+#define DSLICE_ADD(b, c) {            \
+	jump_to_table += (c);             \
+	ADDRITE(c);                       \
+	WFDRITE(b, c);                    \
+	}
+
+#define DSLICE_ADD_TAG(b, c) {        \
+	jump_to_table += (c);             \
+	ADDRITE(-(c));                    \
+	WFDRITE(b, c);                    \
+	}
 
 void parse(char *data, size_t size, int wfd, const char **error) {
 	// above
@@ -164,12 +181,13 @@ void parse(char *data, size_t size, int wfd, const char **error) {
 	// If parsing fails, set error pointer to null-terminated string, which describes error reason.
 
 	errno = 0;
+	uint32_t jump_to_table = 0;
 	uint32_t count = 0;
 	WFDRITE(essb_signature, strizeof(essb_signature));
+	WFDRITE(&jump_to_table, sizeof(jump_to_table));
 	WFDRITE(&count, sizeof(count));
-
+	vec_reset();
 	size_t current_position = 0;
-	uint32_t temp;
 	while(current_position < size) {
 		char *found = strstr(data + current_position, opening_scope_sigil);
 		if (found == NULL) {
@@ -177,7 +195,7 @@ void parse(char *data, size_t size, int wfd, const char **error) {
 			count++;
 			break;
 		}
-		if (found != data + current_position) { // make don't need to add data if we found another tag right after tag
+		if (found != data + current_position) { // don't need to add data if we found another tag right after tag
 			count++;
 			DSLICE_ADD(data + current_position, found - data - current_position);
 		}
@@ -190,8 +208,12 @@ void parse(char *data, size_t size, int wfd, const char **error) {
 			current_position = found - data + strizeof(closing_scope_sigil);
 		}
 	}
-	if (IS_BIG_ENDIAN) count = swap_uint32(count);
+	static const char empty[3];
+	unsigned residue = 4 - (jump_to_table % 4);
+	if (residue != 4) WFDRITE(empty, residue);
+	WFDRITE(ve, v_amount * sizeof(int32_t));
 	if (nposix_pwrite(wfd, &count, sizeof(count), strizeof(essb_signature)) < 0) goto posix_error;
+	if (nposix_pwrite(wfd, &jump_to_table, sizeof(jump_to_table), strizeof(essb_signature) + sizeof(count)) < 0) goto posix_error;
 	*error = NULL;
 	return;
 	posix_error:
@@ -199,7 +221,6 @@ void parse(char *data, size_t size, int wfd, const char **error) {
 	return;
 	parse_error:
 	*error = parser_error_string;
-	return;
 }
 
 int main(int argc, char **argv) {
@@ -213,6 +234,8 @@ int main(int argc, char **argv) {
 	struct rlimit l;
 	if (getrlimit(RLIMIT_STACK, &l) < 0) return perror("GETRLIMIT FAILED!"), EXIT_FAILURE;
 	size_t usable_stack_amount = l.rlim_cur - STACK_REDUNDANCE;
+	ve = malloc(v_max * sizeof(int32_t));
+	if (ve == NULL) return perror("failed to allocate such small amount of memory, lool"), EXIT_FAILURE;
 
 	struct dirent *ent;
 	while ((ent = readdir(d)) != NULL) {
@@ -240,6 +263,7 @@ int main(int argc, char **argv) {
 		}
 		munmap(data, size);
 	}
+	free(ve);
 	closedir(d);
 	return EXIT_SUCCESS;
 }
